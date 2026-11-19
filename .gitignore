@@ -1,0 +1,13 @@
+# PlatformIO and Python build environments
+.pio/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local MIDI recordings - not shared automatically via GitHub
+desktop_app/recordings/*.mid
+
+# Local OS/editor noise
+.DS_Store
+Thumbs.db
