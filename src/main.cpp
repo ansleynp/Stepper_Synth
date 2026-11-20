@@ -1,5 +1,5 @@
 /*
- * ESP32 MIDI + Serial Piano  ->  3 square-wave voices ("motors") on GPIO21/22/23
+ * ESP32 MIDI + Serial Piano  ->  3 square-wave voices ("motors") on GPIO22/21/19
  * Framework: ESP-IDF (6.x)
  *
  * Voice manager:
@@ -23,7 +23,7 @@
  *   space : stop everything       v : vibrato on/off      ? : help
  *   n     : voice mode: poly -> mono (motor 1 only) -> unison (all motors, same note)
  *
- * Rotary encoder (A=GPIO18, B=GPIO19, button=GPIO5) settings menu:
+ * Rotary encoder (A=GPIO12, B=GPIO14, button=GPIO13) settings menu:
  *   turn = choose a setting, click = edit it, turn = change value, click = done
  */
 
@@ -69,7 +69,7 @@ static const char *const VOICE_MODE_NAMES[] = {"poly", "mono", "unison"};
 
 // ---------------- configuration ----------------
 // One output per motor. Add/remove pins here (max 4: one LEDC timer each).
-static constexpr int        VOICE_PINS[]  = {22, 21, 19};
+static constexpr int        VOICE_PINS[]  = {22, 21, 19};   // M1, M2, M3 (mono plays on M1 = first pin)
 static constexpr int        NUM_VOICES    = sizeof(VOICE_PINS) / sizeof(VOICE_PINS[0]);
 static_assert(NUM_VOICES >= 1 && NUM_VOICES <= 4, "LEDC low-speed mode has 4 timers");
 static constexpr int        MIDI_RX_PIN   = 16;          // MIDI data in
@@ -79,6 +79,14 @@ static constexpr int        ENC_B_PIN     = 14;          // rotary encoder B (DT
 static constexpr int        ENC_BTN_PIN   = 13;           // encoder push button (SW), to GND when pressed
 static constexpr int        ENC_STEPS_PER_DETENT = 4;    // most encoders: 4 (try 2 if one click = 2 steps)
 static constexpr bool       ENC_REVERSE   = false;       // true if clockwise goes the wrong way
+static constexpr bool pinUsedByMotor(int p) {
+  for (int v = 0; v < NUM_VOICES; v++) if (VOICE_PINS[v] == p) return true;
+  return false;
+}
+static_assert(!pinUsedByMotor(ENC_A_PIN) && !pinUsedByMotor(ENC_B_PIN) &&
+              !pinUsedByMotor(ENC_BTN_PIN) && !pinUsedByMotor(MIDI_RX_PIN) &&
+              !pinUsedByMotor(MIDI_TX_PIN),
+              "A motor pin is also used by the encoder or MIDI - pick a different pin");
 static constexpr uart_port_t MIDI_UART    = UART_NUM_2;
 static constexpr uart_port_t CONSOLE_UART = UART_NUM_0;  // USB serial (CP2102)
 static int                  MIDI_CHANNEL  = 0;           // 0 = all channels, 1-16 = only that one (knob-adjustable)
@@ -230,7 +238,7 @@ static void pitchTimerCb(void *) {
       if (sinceDelay > 0.0f) {
         float fade = VIBRATO_FADE_MS ? sinceDelay / (float)VIBRATO_FADE_MS : 1.0f;
         if (fade > 1.0f) fade = 1.0f;
-        cents = VIBRATO_DEPTH_CENTS * fade * lfo(VIBRATO_RATE_HZ * sinceDelay / 1000.0f);
+        cents += VIBRATO_DEPTH_CENTS * fade * lfo(VIBRATO_RATE_HZ * sinceDelay / 1000.0f);
       }
     }
     // higher pitch = smaller divider (10.8 fixed point, valid range 1.0 .. 1023.99)
@@ -506,6 +514,10 @@ static void printCapture() {
 static bool     testNotePending = false;
 static uint32_t testNoteMs = 0;
 
+// encoder state (decoded in encIsr further down)
+static volatile int32_t encRaw   = 0;   // +1 / -1 per valid quadrature transition
+static volatile uint8_t encState = 0;
+
 // ---------------- serial-monitor keyboard ----------------
 static int keyToSemitone(char c) {
   switch (c) {
@@ -581,6 +593,12 @@ static void handleKey(char c) {
       allVoicesOff();
       con_printf("Voice mode: %s\r\n", VOICE_MODE_NAMES[VOICE_MODE]);
       break;
+    case 'i':
+      con_printf("A(GPIO%d)=%d  B(GPIO%d)=%d  BTN(GPIO%d)=%d  encRaw=%ld\r\n",
+                 ENC_A_PIN, gpio_get_level((gpio_num_t)ENC_A_PIN),
+                 ENC_B_PIN, gpio_get_level((gpio_num_t)ENC_B_PIN),
+                 ENC_BTN_PIN, gpio_get_level((gpio_num_t)ENC_BTN_PIN), (long)encRaw);
+      break;
     case 'v':
       VIBRATO_ENABLED = !VIBRATO_ENABLED;
       con_printf("Vibrato %s\r\n", VIBRATO_ENABLED ? "ON" : "OFF");
@@ -609,8 +627,6 @@ static void handleKey(char c) {
 // (No screen yet, so the menu is shown in the serial monitor.)
 
 // --- encoder decoding (GPIO interrupts on A and B, Gray-code state table) ---
-static volatile int32_t encRaw   = 0;   // +1 / -1 per valid quadrature transition
-static volatile uint8_t encState = 0;
 
 static void IRAM_ATTR encIsr(void *) {
   static const int8_t TABLE[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
@@ -873,7 +889,7 @@ extern "C" void app_main(void) {
   gpio_set_intr_type((gpio_num_t)MIDI_RX_PIN, GPIO_INTR_ANYEDGE);
   gpio_isr_handler_add((gpio_num_t)MIDI_RX_PIN, rxEdgeIsr, nullptr);
 
-  encoderInit();                  // rotary encoder on GPIO18/19, button on GPIO5
+  encoderInit();                  // rotary encoder A/B + button (pins set at top)
 
   toneInit();
   pitchEngineStart();
