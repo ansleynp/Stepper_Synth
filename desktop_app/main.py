@@ -1,21 +1,20 @@
 """Stepper Synth desktop companion. Run with python desktop_app/main.py."""
-import io
-from pathlib import Path
 import queue
-import tempfile
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import uuid
 
-import mido
 import midi_files as files
-from harmony import HIGH, LOW, TONICS, SCALES, FAMILIES, chord, identify, pitch, scale_pitch
+from harmony import (HIGH, LOW, TONICS, SCALES, FAMILIES, chord, identify, interval_name, pitch,
+                     scale_pitch)
 from preview_audio import PreviewAudio
 from serial_link import MAX_FILE, SerialLink, available_ports
 
 INK, MUTED, BG, PAPER = "#152e32", "#4e6768", "#edf2ef", "#ffffff"
 TEAL, LIME, LINE = "#126965", "#c3f185", "#cfddda"
 ACCENTS = ("#bbeba0", "#8ddbd1", "#ffd191")
+# Synth transport buttons: request op, button label, keyboard shortcut.
+TRANSPORT = (("record", "● Record / Stop", "1"), ("play", "▶ Play / Pause", "2"),
+             ("reset", "⟲ Reset", "3"))
 
 
 def label(parent, text, size=11, color=INK, bold=False, bg=None):
@@ -54,6 +53,8 @@ class Studio:
         self.live = None
         self.selected = 60
         self.held = set()
+        self.transport = None   # last transport event from the board
+        self.limits = {}        # max_events / max_file from the board's hello
         self.key = tk.StringVar(value="C")
         self.scale = tk.StringVar(value="Major")
         self.family = tk.StringVar(value="Triad")
@@ -74,6 +75,9 @@ class Studio:
         self.refresh()
         self.render()
         self.controls()
+        for op, _, key in TRANSPORT:  # keys 1/2/3 press the synth's buttons
+            root.bind(f"<KeyPress-{key}>",
+                      lambda e, o=op: None if isinstance(e.widget, ttk.Entry) else self.press(o))
         root.after(80, self.poll)
         root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -164,11 +168,25 @@ class Studio:
         label(row, "Recording library", 22, INK, True).pack(side="left")
         button(row, "Create demo MIDI", lambda:self.local(files.create_demo_recording)).pack(side="right")
         button(row, "Import MIDI…", self.import_file, True).pack(side="right", padx=6)
-        self.tree = ttk.Treeview(self.records, columns=("name","duration","notes","tracks"), show="headings", selectmode="browse")
+        card = tk.Frame(self.records, bg=INK, padx=18, pady=12)
+        card.pack(fill="x", pady=(0, 12))
+        label(card, "SYNTH TRANSPORT  ·  keys 1 / 2 / 3", 10, LIME, True).pack(anchor="w")
+        line = tk.Frame(card, bg=INK)
+        line.pack(fill="x")
+        self.transport_label = label(line, "", 16, PAPER, True)
+        self.transport_label.pack(side="left", pady=(4, 0))
+        self.transport_btns = []
+        for op, text, key in reversed(TRANSPORT):
+            b = button(line, f"{text}  [{key}]", lambda o=op: self.press(o), op == "record")
+            b.pack(side="right", padx=(6, 0))
+            self.transport_btns.append(b)
+        self.transport_hint = label(card, "", 10, "#c7dcd8")
+        self.transport_hint.pack(anchor="w")
+        self.tree = ttk.Treeview(self.records, columns=("name","duration","notes","tracks","remove"), show="headings", selectmode="browse")
         for key, title, width in [("name","Recording",380),("duration","Length",85),
-                                  ("notes","Notes",65),("tracks","Tracks",65)]:
-            self.tree.heading(key, text=title, anchor="w")
-            self.tree.column(key, width=width, stretch=key=="name")
+                                  ("notes","Notes",65),("tracks","Tracks",65),("remove","Remove",70)]:
+            self.tree.heading(key, text=title, anchor="center" if key=="remove" else "w")
+            self.tree.column(key, width=width, stretch=key=="name", anchor="center" if key=="remove" else "w")
         scroll = ttk.Scrollbar(self.records, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         area = tk.Frame(self.records, bg=BG)
@@ -177,13 +195,127 @@ class Studio:
         self.count.pack(side="left")
         self.loadbtn = button(area, "Load onto synth", self.load_file)
         self.loadbtn.pack(side="right")
-        self.savebtn = button(area, "Save from synth", lambda:self.job("save"))
+        self.savebtn = button(area, "Save from synth…", lambda:self.job("save"))
         self.savebtn.pack(side="right", padx=6)
+        tools = tk.Frame(self.records, bg=PAPER, padx=14, pady=8)
+        tools.pack(side="bottom", fill="x", pady=(10, 0))
+        label(tools, "Transpose", 11, INK, True).pack(side="left")
+        self.transpose = tk.IntVar(value=0)
+        spin = ttk.Spinbox(tools, from_=-24, to=24, increment=1, width=4, state="readonly",
+                           textvariable=self.transpose, command=self.show_transpose)
+        spin.pack(side="left", padx=(10, 4))
+        label(tools, "semitones", 10, MUTED).pack(side="left")
+        self.transpose_label = label(tools, "", 10, TEAL, True)
+        self.transpose_label.pack(side="left", padx=12)
+        self.copybtn = button(tools, "Save transposed copy", self.save_transposed)
+        self.copybtn.pack(side="right")
+        button(tools, "Reset", lambda: (self.transpose.set(0), self.show_transpose())).pack(
+            side="right", padx=6)
+        self.show_transpose()
         scroll.pack(side="right", fill="y")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", lambda e:self.controls())
+        self.tree.bind("<ButtonRelease-1>", self.tree_click)
+        self.tree.bind("<Motion>", lambda e: self.tree.configure(
+            cursor="hand2" if self.on_remove(e) else ""))
+        for key in ("<Delete>", "<BackSpace>"):
+            self.tree.bind(key, lambda _e: self.remove_file(self.tree.focus()))
+        self.renaming = None  # (entry widget, original file name) while editing a name
+        self.tree.bind("<Double-1>", self.start_rename)
+        self.tree.bind("<MouseWheel>", lambda _e: self.finish_rename(True), add="+")
+        self.show_transport()
+
+    def start_rename(self, event):
+        """Double-click a name: edit it in place. Enter/click away saves, Escape cancels."""
+        if (self.tree.identify_region(event.x, event.y) != "cell"
+                or self.tree.identify_column(event.x) != "#1"):
+            return
+        name = self.tree.identify_row(event.y)
+        bbox = name and self.tree.bbox(name, "name")
+        if not bbox:
+            return
+        self.finish_rename(True)
+        entry = ttk.Entry(self.tree)
+        entry.insert(0, name)
+        entry.select_range(0, len(name.rsplit(".", 1)[0]))  # select the name, not ".mid"
+        entry.icursor(len(name.rsplit(".", 1)[0]))
+        x, y, width, height = bbox
+        entry.place(x=x, y=y, width=width, height=height)
+        entry.focus_set()
+        for key in ("<Return>", "<KP_Enter>", "<FocusOut>"):
+            entry.bind(key, lambda _e: self.finish_rename(True))
+        entry.bind("<Escape>", lambda _e: self.finish_rename(False))
+        self.renaming = (entry, name)
+
+    def finish_rename(self, commit):
+        if not self.renaming:
+            return
+        (entry, old), self.renaming = self.renaming, None  # clear first: destroy fires FocusOut
+        new = entry.get().strip()
+        entry.destroy()
+        self.tree.focus_set()
+        if not commit or new in ("", old):
+            return
+        try:
+            dest = files.rename_recording(old, new)
+            self.status.configure(text=f"Renamed {old} → {dest.name}")
+            self.refresh(dest)
+        except Exception as exc:
+            messagebox.showerror("Rename recording", str(exc))
+            self.refresh(files.RECORDINGS / old)
+
+    def on_remove(self, event):
+        """True if the pointer is on a row's ✕ Remove cell."""
+        return (self.tree.identify_region(event.x, event.y) == "cell"
+                and self.tree.identify_column(event.x) == "#5")
+
+    def tree_click(self, event):
+        if self.on_remove(event):
+            self.remove_file(self.tree.identify_row(event.y))
+
+    def remove_file(self, name):
+        if not name or not self.tree.exists(name):
+            return
+        if not messagebox.askyesno("Remove recording",
+                f"Delete {name}?\n\nThe file is permanently removed from desktop_app/recordings.",
+                icon="warning", default="no"):
+            return
+        try:
+            files.remove_recording(name)
+            self.status.configure(text=f"Removed {name}")
+        except Exception as exc:
+            messagebox.showerror("Remove recording", str(exc))
+        self.refresh()
+
+    def show_transport(self):
+        t = self.transport
+        if not self.link or "transport" not in self.caps:
+            text, hint = "Synth not connected", "Connect a board running the looper firmware to record, play and reset."
+        elif t is None:
+            text, hint = "Waiting for synth…", ""
+        else:
+            state, length = t.get("state", "?"), t.get("length_ms", 0) / 1000
+            events = t.get("events", 0)
+            text = {"recording": f"● Recording  ·  {events} events",
+                    "playing": f"▶ Playing  ·  {length:.1f} s loop",
+                    "paused": f"❚❚ Paused at {t.get('pos_ms', 0)/1000:.1f} s of {length:.1f} s",
+                    }.get(state, f"■ Stopped  ·  {length:.1f} s take" if length else "■ No take on the synth")
+            hint = ("The take starts on the first note. Press Record again to finish." if state == "recording"
+                    else f"{events} note events in SRAM · loops without the computer while powered." if length
+                    else "Press Record and play, or load a MIDI file below.")
+        self.transport_label.configure(text=text)
+        self.transport_hint.configure(text=hint)
+
+    def press(self, op):
+        if not self.link or "transport" not in self.caps:
+            self.status.configure(text="Connect the synth to use Record / Play / Reset.")
+        elif self.busy:
+            self.status.configure(text="Synth is busy · try again in a moment.")
+        else:
+            self.job(op)
 
     def refresh(self, chosen=None):
+        self.finish_rename(False)  # rows are rebuilt; drop any half-typed name
         for item in self.tree.get_children():
             self.tree.delete(item)
         for p in files.list_recordings():
@@ -191,12 +323,13 @@ class Studio:
                 tracks, notes, duration = files.midi_info(p)
             except Exception:
                 tracks, notes, duration = "—","—","Unreadable"
-            self.tree.insert("", "end", iid=p.name, values=(p.name,duration,notes,tracks))
+            self.tree.insert("", "end", iid=p.name, values=(p.name,duration,notes,tracks,"✕"))
         if chosen and self.tree.exists(chosen.name):
             self.tree.selection_set(chosen.name)
             self.tree.see(chosen.name)
         total = len(self.tree.get_children())
-        self.count.configure(text=f"{total} local recording{'s' if total != 1 else ''}")
+        self.count.configure(text=f"{total} local recording{'s' if total != 1 else ''}"
+                                  "  ·  double-click a name to rename")
         self.controls()
 
     def local(self, action):
@@ -220,12 +353,42 @@ class Studio:
             p = files.RECORDINGS / sel[0]
             if p.stat().st_size > MAX_FILE:
                 raise ValueError("File exceeds the 256 KiB desktop transfer limit.")
-            data = p.read_bytes()
-            mido.MidiFile(file=io.BytesIO(data))
-            if messagebox.askyesno("Load recording", f"Replace the current synth take with {p.name}?"):
-                self.job("load", data)
+            shift = self.transpose.get()
+            max_events, max_file = self.limits.get("max_events"), self.limits.get("max_file", MAX_FILE)
+            take = files.board_bytes(p, shift, max_events)
+            if len(take.data) > max_file:
+                raise ValueError(f"{p.name} is {len(take.data)//1024} KB after conversion; the synth accepts {max_file//1024} KB.")
+            cut = (f"\n\nToo long for the synth: {take.full_events} note events, it holds {max_events}. "
+                   f"Only the first {take.seconds:.1f} s of {take.full_seconds:.1f} s will be loaded and looped."
+                   if take.truncated else "")
+            if messagebox.askyesno("Load recording",
+                    f"Replace the take on the synth with {p.name}?\n\n"
+                    f"{take.events} note events · {take.seconds:.1f} s loop"
+                    + (f" · transposed {shift:+d} ({interval_name(shift)})" if shift else "")
+                    + (f"\n{take.folded} note events folded by octaves to stay in MIDI range." if take.folded else "")
+                    + cut + "\n\nPlayback stops; press Play to start it.",
+                    icon="warning" if take.truncated else "question"):
+                self.job("load", take.data)
         except Exception as exc:
             messagebox.showerror("Load recording", str(exc))
+
+    def show_transpose(self):
+        shift = self.transpose.get()
+        self.transpose_label.configure(text=interval_name(shift) +
+                                       ("  ·  applied when loading onto the synth" if shift else ""))
+        self.controls()
+
+    def save_transposed(self):
+        sel, shift = self.tree.selection(), self.transpose.get()
+        if not sel or not shift:
+            return
+        try:
+            dest, folded = files.transpose_copy(files.RECORDINGS / sel[0], shift)
+            self.refresh(dest)
+            self.status.configure(text=f"Saved {dest.name} · {interval_name(shift)}"
+                                       + (f" · {folded} notes folded by octaves" if folded else ""))
+        except Exception as exc:
+            messagebox.showerror("Transpose", str(exc))
 
     def render(self):
         auto = self.mode.get() == "Auto"
@@ -318,7 +481,9 @@ class Studio:
         for widget, enabled in [(self.apply_btn,free and "chords" in self.caps),
             (self.exit_btn,free and self.board_mode!="ordinary"),
             (self.savebtn,available),(self.loadbtn,available and self.tree.selection()),
-            (self.connect_btn,bool(self.link) or bool(self.port.get()))]:
+            (self.copybtn,bool(self.tree.selection()) and self.transpose.get() != 0),
+            (self.connect_btn,bool(self.link) or bool(self.port.get()))] + [
+            (b, free and bool(self.link) and "transport" in self.caps) for b in self.transport_btns]:
             widget.state(["!disabled" if enabled else "disabled"])
 
     def connect(self):
@@ -337,11 +502,14 @@ class Studio:
             self.link.stop_event.set()
         self.link = None
         self.caps.clear()
+        self.limits = {}
+        self.transport = None
         self.busy = False
         self.active = self.pending = self.live = None
         self.board_mode = "ordinary"
         self.indicator.configure(text="Offline")
         self.connect_btn.configure(text="Connect")
+        self.show_transport()
         self.render()
         self.controls()
 
@@ -369,7 +537,11 @@ class Studio:
             if op=="opened":
                 self.indicator.configure(text="Port open · checking firmware")
                 continue
-            if op=="voices":
+            if op=="event" and result.get("event")=="transport":
+                self.transport = result
+                self.show_transport()
+                continue
+            if op=="event" and result.get("event")=="voices":
                 notes, held = result.get("notes"), result.get("held",[])
                 if (self.board_mode!="ordinary" and isinstance(notes,list) and len(notes)<=3
                     and all(type(x)==int and LOW<=x<=HIGH for x in notes)
@@ -378,6 +550,8 @@ class Studio:
                     self.live = result
                     self.render()
                 continue
+            if op=="event":
+                continue  # unknown event type from newer firmware
             self.busy = False
             if op=="lost":
                 self.disconnect()
@@ -388,8 +562,11 @@ class Studio:
                 caps = result.get("caps")
                 if isinstance(caps,list):
                     self.caps = {c for c in caps if isinstance(c,str)}
+                self.limits = {k: result[k] for k in ("max_events","max_file")
+                               if type(result.get(k))==int and result[k] > 0}
                 self.indicator.configure(text="Firmware connected")
                 self.status.configure(text="ESP32 handshake acknowledged")
+                self.show_transport()
             elif op in ("map","identify","ordinary"):
                 self.board_mode = op
                 self.active = self.pending if op=="map" else None
@@ -398,24 +575,24 @@ class Studio:
                     "identify":"Identify active","ordinary":"Ordinary keyboard play restored"}[op])
                 self.render()
             elif op=="save":
-                self.local(lambda:self.save_take(result))
+                self.save_take(result)
             elif op=="load":
-                self.status.configure(text="Recording loaded · acknowledged by ESP32")
+                self.status.configure(text=f"Loaded onto synth · {result.get('events','?')} note events, "
+                                           f"{result.get('length_ms',0)/1000:.1f} s loop · press Play")
+            elif op in ("record","play","reset"):
+                self.status.configure(text="Synth acknowledged " + op)
             self.controls()
         self.root.after(80,self.poll)
 
     def save_take(self, data):
-        mido.MidiFile(file=io.BytesIO(data))
-        folder = files.ensure_folder()
-        dest = folder / f"synth_{uuid.uuid4().hex[:10]}.mid"
-        with tempfile.NamedTemporaryFile(dir=folder,delete=False) as out:
-            temp = Path(out.name)
-        try:
-            temp.write_bytes(data)
-            temp.replace(dest)
-        finally:
-            temp.unlink(missing_ok=True)
-        return dest
+        dest = filedialog.asksaveasfilename(
+            title="Save synth recording as MIDI", initialdir=files.ensure_folder(),
+            initialfile=files.default_take_name(), defaultextension=".mid",
+            filetypes=[("MIDI files","*.mid *.midi")])
+        if not dest:
+            self.status.configure(text="Save cancelled · the take is still on the synth")
+            return
+        self.local(lambda: files.save_bytes(data, dest))
 
     def close(self):
         self.audio.close()

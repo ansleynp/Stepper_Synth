@@ -41,6 +41,13 @@ class SerialLink(threading.Thread):
             if isinstance(data, dict) and data.get("v") == 1:
                 yield data
 
+    def forward(self, msg):
+        """Pass unsolicited firmware events (voices, transport) to the GUI."""
+        if isinstance(msg.get("event"), str):
+            self.events.put(("event", msg))
+            return True
+        return False
+
     def request(self, op, **fields):
         token = uuid.uuid4().hex[:12]
         self.port.write((json.dumps(dict(v=1, id=token, op=op, **fields),
@@ -48,9 +55,9 @@ class SerialLink(threading.Thread):
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline and not self.stop_event.is_set():
             for msg in self.frame():
-                if msg.get("event") == "voices":
-                    self.events.put(("voices", msg))
-                elif msg.get("id") == token:
+                if self.forward(msg):
+                    continue
+                if msg.get("id") == token:
                     if msg.get("ok") is not True:
                         raise ValueError(str(msg.get("error", "Request declined")))
                     return msg
@@ -58,7 +65,12 @@ class SerialLink(threading.Thread):
 
     def execute(self, op, arg):
         if op == "open":
-            self.port = serial.Serial(arg, 115200, timeout=.025, write_timeout=1)
+            self.port = serial.Serial(timeout=.025, write_timeout=1)
+            self.port.port, self.port.baudrate = arg, 115200
+            # Keep DTR/RTS released so the dev board's auto-reset circuit doesn't
+            # reboot the ESP32 (which would wipe the take stored in SRAM).
+            self.port.dtr = self.port.rts = False
+            self.port.open()
             self.rx.clear()
             self.events.put(("opened", arg))
             self.stop_event.wait(1.5)  # Some dev boards reset on port open.
@@ -96,8 +108,7 @@ class SerialLink(threading.Thread):
                 except queue.Empty:
                     if self.port and (self.port.in_waiting or b'\n' in self.rx):
                         for msg in self.frame():
-                            if msg.get("event") == "voices":
-                                self.events.put(("voices", msg))
+                            self.forward(msg)
                     if time.monotonic() >= next_ping:
                         self.request("ping")
                         next_ping = time.monotonic() + 1

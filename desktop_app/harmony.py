@@ -77,3 +77,17 @@ def identify(notes):
     names = [f"{PITCHES[r]} {shapes[s]}" for r in sorted(pcs)
              if (s := tuple(sorted((p-r) % 12 for p in pcs))) in shapes]
     return " / ".join(names) or (" · ".join(pitch(n) for n in sorted(notes)) or "Waiting for notes")
+
+
+INTERVALS = ("unison", "minor 2nd", "major 2nd", "minor 3rd", "major 3rd", "perfect 4th",
+             "tritone", "perfect 5th", "minor 6th", "major 6th", "minor 7th", "major 7th")
+
+
+def interval_name(semitones):
+    """Describe a transposition, e.g. +7 -> 'perfect 5th up', -12 -> '1 octave down'."""
+    if semitones == 0:
+        return "original key"
+    octaves, rest = divmod(abs(semitones), 12)
+    parts = ([f"{octaves} octave{'s' if octaves > 1 else ''}"] if octaves else []) + \
+            ([INTERVALS[rest]] if rest else [])
+    return " + ".join(parts) + (" up" if semitones > 0 else " down")

@@ -44,3 +44,30 @@ This desktop version exchanges complete Standard MIDI File bytes. The applicatio
 | write_commit | Validate size, MIDI structure and supported event/range limits, then swap the staged take into SRAM and acknowledge. Return an error if the take cannot be played. |
 
 The desktop transfer limit is 256 KiB. The board should enforce its actual remaining SRAM limit, which may be smaller. On disconnect, error or inactivity, discard incomplete writes and release read snapshots. Keep the old playable take until commit succeeds. The app validates downloaded MIDI before saving a new local file. A transfer timeout at commit leaves the result unconfirmed on the desktop.
+
+## Transport (looper)
+
+Implemented by `src/main.cpp`, which advertises caps `["midi_file","transport"]` plus `max_events` (note on/off events the take can hold) and `max_file` (largest accepted .mid in bytes) in the hello reply. It does not implement the live-chord requests.
+
+| Request | Board behavior |
+| --- | --- |
+| record | Same as the record button: start a new take, or stop the one being recorded. |
+| play | Same as the play button: play / pause. Pressed while recording, it stops recording and plays. |
+| reset | Same as the reset button: stop playback (or recording) and rewind to the start. |
+| status | Acknowledge and publish a transport event. |
+
+The board publishes a transport event after hello, on every button press (physical, serial key 1/2/3, or desktop request) and after a successful write_commit:
+
+```json
+{"v":1,"event":"transport","state":"playing","events":48,"length_ms":5120,"pos_ms":0}
+```
+
+state is one of stopped, recording, playing, paused. Desktops should ignore event types they don't know.
+
+Board details:
+
+- A take starts on its first note, so silence after pressing Record is trimmed. It ends when Record (or Play / Reset) is pressed. The loop length runs to that press.
+- read_begin is refused while recording or when there is no take. write_commit is refused while recording. A successful commit stops playback and rewinds; press Play to start the new take.
+- Files written by the board are format 0, one track, 480 ticks per beat at 480000 µs per beat, so 1 tick = 1 ms. End of Track marks the loop length.
+- The board reads format 0 (or single-track format 1) files with any PPQ and tempo changes, keeping only note on/off. The desktop converts other files to that form before uploading (`midi_files.board_bytes`).
+- The desktop opens the port with DTR and RTS released so the dev board's auto-reset circuit does not reboot the ESP32 and wipe the take.

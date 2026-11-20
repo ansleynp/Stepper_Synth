@@ -25,15 +25,27 @@
  *
  * Rotary encoder (A=GPIO12, B=GPIO14, button=GPIO13) settings menu:
  *   turn = choose a setting, click = edit it, turn = change value, click = done
+ *
+ * Transport push buttons (pin -> button -> GND, internal pull-ups; pins set in
+ * TRANSPORT BUTTONS below). Serial monitor keys 1 / 2 / 3 press the same buttons:
+ *   1 / D25 : start / stop recording (the take starts on its first note)
+ *   2 / D26 : play / pause the recording (it loops)
+ *   3 / D27 : reset - stop playback and rewind to the start
+ * The take lives in SRAM and keeps looping with the computer unplugged, as
+ * long as the board stays powered. The desktop app (desktop_app/) can save it
+ * as a .mid file or load a .mid file onto the board using JSON lines on this
+ * same serial port - see desktop_app/FIRMWARE_INTERFACE.md.
  */
 
 #include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "driver/gpio.h"
+#include "esp_heap_caps.h"
 #include "driver/ledc.h"
 #include "hal/ledc_ll.h"   // direct access to the timer's fractional divider
 #include "driver/uart.h"
@@ -79,14 +91,31 @@ static constexpr int        ENC_B_PIN     = 14;          // rotary encoder B (DT
 static constexpr int        ENC_BTN_PIN   = 13;           // encoder push button (SW), to GND when pressed
 static constexpr int        ENC_STEPS_PER_DETENT = 4;    // most encoders: 4 (try 2 if one click = 2 steps)
 static constexpr bool       ENC_REVERSE   = false;       // true if clockwise goes the wrong way
+// =====================================================================
+//                     TRANSPORT BUTTONS  (change pins here)
+// =====================================================================
+// Wire each button from its pin to GND; the internal pull-up is enabled.
+static constexpr int        BTN_RECORD_PIN = 25;         // D25: start / stop recording
+static constexpr int        BTN_PLAY_PIN   = 26;         // D26: play / pause (loops)
+static constexpr int        BTN_RESET_PIN  = 27;         // D27: stop playback + rewind
+static constexpr uint32_t   BTN_DEBOUNCE_MS = 30;        // level must be steady this long
+// =====================================================================
 static constexpr bool pinUsedByMotor(int p) {
   for (int v = 0; v < NUM_VOICES; v++) if (VOICE_PINS[v] == p) return true;
   return false;
 }
-static_assert(!pinUsedByMotor(ENC_A_PIN) && !pinUsedByMotor(ENC_B_PIN) &&
-              !pinUsedByMotor(ENC_BTN_PIN) && !pinUsedByMotor(MIDI_RX_PIN) &&
-              !pinUsedByMotor(MIDI_TX_PIN),
-              "A motor pin is also used by the encoder or MIDI - pick a different pin");
+static constexpr int OTHER_PINS[] = {MIDI_RX_PIN, MIDI_TX_PIN, ENC_A_PIN, ENC_B_PIN, ENC_BTN_PIN,
+                                     BTN_RECORD_PIN, BTN_PLAY_PIN, BTN_RESET_PIN};
+static constexpr bool pinsAreDistinct() {
+  constexpr int n = sizeof(OTHER_PINS) / sizeof(OTHER_PINS[0]);
+  for (int i = 0; i < n; i++) {
+    if (pinUsedByMotor(OTHER_PINS[i])) return false;
+    for (int j = i + 1; j < n; j++) if (OTHER_PINS[i] == OTHER_PINS[j]) return false;
+  }
+  return true;
+}
+static_assert(pinsAreDistinct(),
+              "Two features (motor / MIDI / encoder / buttons) share a GPIO - pick different pins");
 static constexpr uart_port_t MIDI_UART    = UART_NUM_2;
 static constexpr uart_port_t CONSOLE_UART = UART_NUM_0;  // USB serial (CP2102)
 static int                  MIDI_CHANNEL  = 0;           // 0 = all channels, 1-16 = only that one (knob-adjustable)
@@ -402,7 +431,10 @@ static void voiceOff(uint8_t note, const char *tag) {
     if (voices[v].active && voices[v].note == note) voiceRelease(v, tag);
 }
 
+static void seqAllNotesOff();   // recorder hook, defined below
+
 static void allVoicesOff() {
+  seqAllNotesOff();
   heldCount = 0;
   for (int v = 0; v < NUM_VOICES; v++) voiceStop(v);
   if (MIDI_DEBUG) con_printf("ALL MOTORS OFF\r\n");
@@ -418,9 +450,245 @@ static void voiceServiceTimedReleases() {
       voiceRelease(v, "KEY OFF ");
 }
 
+// ---------------- recorder / looper (call with stateLock held) ----------------
+// One take of note events lives in SRAM. Event times are ms from the take's
+// first note. Playback loops: after seqLengthMs it jumps back to the start.
+// Recording captures MIDI IN and serial-keyboard notes (not playback itself).
+enum SeqState { SEQ_STOPPED, SEQ_RECORDING, SEQ_PLAYING, SEQ_PAUSED };
+static const char *const SEQ_STATE_NAMES[] = {"stopped", "recording", "playing", "paused"};
+enum SeqButton { SEQ_BTN_RECORD, SEQ_BTN_PLAY, SEQ_BTN_RESET };
+
+struct SeqEvent {
+  uint32_t ms;        // time from the start of the take
+  uint8_t  status;    // 0x90 note on / 0x80 note off
+  uint8_t  note;
+  uint8_t  velocity;
+};
+static constexpr int      SEQ_MAX_EVENTS    = 6000;                 // 8 bytes each = 48 KB
+static constexpr uint32_t SEQ_MAX_LENGTH_MS = 60u * 60u * 1000u;    // 1 hour
+
+static SeqEvent          seqEvents[SEQ_MAX_EVENTS];
+static int               seqCount    = 0;
+static uint32_t          seqLengthMs = 0;           // loop length; 0 = no take
+static volatile SeqState seqState    = SEQ_STOPPED;
+static int               seqIndex    = 0;           // next event to play
+static uint32_t          seqPosMs    = 0;           // position while stopped / paused
+static int64_t           seqZeroUs   = 0;           // when position 0 of this pass happened
+static uint32_t          seqSounding[4];            // notes playback switched on (128-bit set)
+static int64_t           recStartUs  = -1;          // first note of the take being recorded
+static uint32_t          recHeld[4];                // notes on in the take being recorded
+struct RecPendingOff { uint8_t note; uint32_t atMs; };
+static RecPendingOff     recPending[MAX_HELD];      // recorded keyboard notes that end by themselves
+static int               recPendingCount = 0;
+
+static bool bitTest(const uint32_t *s, int n) { return (s[n >> 5] >> (n & 31)) & 1u; }
+static void bitSet(uint32_t *s, int n)        { s[n >> 5] |= 1u << (n & 31); }
+static void bitClear(uint32_t *s, int n)      { s[n >> 5] &= ~(1u << (n & 31)); }
+static int  bitCount(const uint32_t *s) {
+  return __builtin_popcount(s[0]) + __builtin_popcount(s[1]) +
+         __builtin_popcount(s[2]) + __builtin_popcount(s[3]);
+}
+
+static uint32_t seqPositionMs() {
+  if (seqState != SEQ_PLAYING) return seqPosMs;
+  int64_t ms = (esp_timer_get_time() - seqZeroUs) / 1000;
+  return ms < 0 ? 0 : ms > seqLengthMs ? seqLengthMs : (uint32_t)ms;
+}
+
+// Tell the desktop app (if listening) what the transport is doing.
+static void seqPublish() {
+  char buf[160];
+  int n = snprintf(buf, sizeof(buf),
+                   "{\"v\":1,\"event\":\"transport\",\"state\":\"%s\",\"events\":%d,"
+                   "\"length_ms\":%lu,\"pos_ms\":%lu}\n",
+                   SEQ_STATE_NAMES[seqState], seqCount, (unsigned long)seqLengthMs,
+                   (unsigned long)seqPositionMs());
+  if (n > 0 && n < (int)sizeof(buf)) uart_write_bytes(CONSOLE_UART, buf, n);
+}
+
+// Release only the notes playback is holding (live playing is left alone).
+static void seqSilence() {
+  for (int n = 0; n < 128; n++)
+    if (bitTest(seqSounding, n)) voiceOff((uint8_t)n, "PLAY OFF");
+  memset(seqSounding, 0, sizeof(seqSounding));
+}
+
+static uint32_t recClockMs() { return (uint32_t)((esp_timer_get_time() - recStartUs) / 1000); }
+
+static void recAppend(uint8_t status, uint8_t note, uint8_t velocity, uint32_t ms) {
+  seqEvents[seqCount++] = {ms, status, note, velocity};
+}
+
+static void recStop() {
+  if (recStartUs >= 0) {
+    uint32_t end = recClockMs();
+    for (int n = 0; n < 128; n++)               // close notes still held at the end
+      if (bitTest(recHeld, n)) recAppend(0x80, (uint8_t)n, 64, end);
+    if (seqCount && end <= seqEvents[seqCount - 1].ms) end = seqEvents[seqCount - 1].ms + 1;
+    seqLengthMs = end;
+  } else {
+    seqCount = 0;                               // no notes were played
+    seqLengthMs = 0;
+  }
+  memset(recHeld, 0, sizeof(recHeld));
+  recPendingCount = 0;
+  seqState = SEQ_STOPPED;
+  seqIndex = 0;
+  seqPosMs = 0;
+  if (seqLengthMs) con_printf("REC stopped - %d events, %.2f s loop\r\n", seqCount, seqLengthMs / 1000.0);
+  else             con_printf("REC stopped - no notes were played\r\n");
+}
+
+static void recStart() {
+  seqSilence();
+  seqCount = 0;
+  seqLengthMs = 0;
+  seqIndex = 0;
+  seqPosMs = 0;
+  recStartUs = -1;
+  memset(recHeld, 0, sizeof(recHeld));
+  recPendingCount = 0;
+  seqState = SEQ_RECORDING;
+  con_printf("REC armed - the take starts on the first note\r\n");
+}
+
+static void recNoteOff(uint8_t note) {
+  if (seqState != SEQ_RECORDING || !bitTest(recHeld, note)) return;
+  recAppend(0x80, note, 64, recClockMs());
+  bitClear(recHeld, note);
+}
+
+static void recNoteOn(uint8_t note, uint8_t velocity) {
+  if (seqState != SEQ_RECORDING) return;
+  if (recStartUs < 0) recStartUs = esp_timer_get_time();   // the take starts on its first note
+  recNoteOff(note);                                        // a re-press ends the previous one
+  // always keep room to close every held note when recording stops
+  if (seqCount + 2 + bitCount(recHeld) > SEQ_MAX_EVENTS || recClockMs() >= SEQ_MAX_LENGTH_MS) {
+    con_printf("REC memory full - recording stopped\r\n");
+    recStop();
+    seqPublish();
+    return;
+  }
+  recAppend(0x90, note, velocity ? velocity : 1, recClockMs());
+  bitSet(recHeld, note);
+}
+
+// Serial-keyboard notes stop by themselves after holdMs (0 = held until space).
+static void recKeyNote(uint8_t note, uint32_t holdMs) {
+  recNoteOn(note, 100);
+  if (seqState != SEQ_RECORDING || holdMs == 0) return;
+  uint32_t at = millis() + holdMs;
+  for (int i = 0; i < recPendingCount; i++)
+    if (recPending[i].note == note) { recPending[i].atMs = at; return; }
+  if (recPendingCount == MAX_HELD) {           // full: end the oldest one now
+    recNoteOff(recPending[0].note);
+    recPendingCount--;
+    memmove(recPending, recPending + 1, sizeof(recPending[0]) * recPendingCount);
+  }
+  recPending[recPendingCount++] = {note, at};
+}
+
+// Call regularly: records the note-offs of timed keyboard notes.
+static void recService() {
+  uint32_t ms = millis();
+  for (int i = 0; i < recPendingCount;) {
+    if ((int32_t)(ms - recPending[i].atMs) >= 0) {
+      recNoteOff(recPending[i].note);
+      recPending[i] = recPending[--recPendingCount];
+    } else {
+      i++;
+    }
+  }
+}
+
+// allVoicesOff() hook: a panic / all-notes-off also ends recorded and played notes.
+static void seqAllNotesOff() {
+  memset(seqSounding, 0, sizeof(seqSounding));
+  for (int n = 0; n < 128; n++) recNoteOff((uint8_t)n);
+  recPendingCount = 0;
+}
+
+static void seqPlay() {
+  if (!seqLengthMs) {
+    con_printf("PLAY - nothing recorded yet\r\n");
+    return;
+  }
+  if (seqPosMs >= seqLengthMs) { seqPosMs = 0; seqIndex = 0; }
+  seqZeroUs = esp_timer_get_time() - (int64_t)seqPosMs * 1000;
+  seqState  = SEQ_PLAYING;
+  con_printf("PLAY from %.2f s (loop %.2f s)\r\n", seqPosMs / 1000.0, seqLengthMs / 1000.0);
+}
+
+static void seqPause() {
+  seqPosMs = seqPositionMs();
+  seqState = SEQ_PAUSED;
+  seqSilence();
+  con_printf("PAUSE at %.2f s\r\n", seqPosMs / 1000.0);
+}
+
+static void seqReset() {
+  if (seqState == SEQ_RECORDING) recStop();   // keeps what was recorded
+  seqSilence();
+  seqState = SEQ_STOPPED;
+  seqIndex = 0;
+  seqPosMs = 0;
+  con_printf("RESET - back to the start\r\n");
+}
+
+// One press of a transport button (physical, serial key, or desktop app).
+static void seqButton(int button) {
+  switch (button) {
+    case SEQ_BTN_RECORD:
+      if (seqState == SEQ_RECORDING) recStop();
+      else                           recStart();
+      break;
+    case SEQ_BTN_PLAY:
+      if (seqState == SEQ_RECORDING)    { recStop(); seqPlay(); }
+      else if (seqState == SEQ_PLAYING) seqPause();
+      else                              seqPlay();
+      break;
+    case SEQ_BTN_RESET:
+      seqReset();
+      break;
+  }
+  seqPublish();
+}
+
+static void seqFire(const SeqEvent &e) {
+  if (e.status == 0x90 && e.velocity) {
+    voiceOn(e.note, 0, "PLAY ON ");
+    bitSet(seqSounding, e.note);
+  } else if (bitTest(seqSounding, e.note)) {
+    voiceOff(e.note, "PLAY OFF");
+    bitClear(seqSounding, e.note);
+  }
+}
+
+// Called every 1 ms while playing: fire due events, loop at the end of the take.
+static void seqService() {
+  if (seqState != SEQ_PLAYING) return;
+  int64_t now  = esp_timer_get_time();
+  int64_t loop = (int64_t)seqLengthMs * 1000;
+  for (;;) {
+    uint32_t pos = (uint32_t)((now - seqZeroUs) / 1000);
+    while (seqIndex < seqCount && seqEvents[seqIndex].ms <= pos) seqFire(seqEvents[seqIndex++]);
+    if (pos < seqLengthMs) return;
+    seqSilence();                     // end of the take: back to the start
+    seqIndex  = 0;
+    seqZeroUs += loop;
+    if (now - seqZeroUs >= loop) seqZeroUs = now;   // fell a whole loop behind: resync
+  }
+}
+
 // ---------------- MIDI note handling (call with stateLock held) ----------
-static void midiNoteOn(uint8_t note) { voiceOn(note, 0, "MIDI ON "); }
-static void midiNoteOff(uint8_t note) { voiceOff(note, "MIDI OFF"); }
+static void midiNoteOn(uint8_t note, uint8_t velocity) {
+  recNoteOn(note, velocity);
+  voiceOn(note, 0, "MIDI ON ");
+}
+static void midiNoteOff(uint8_t note) {
+  recNoteOff(note);
+  voiceOff(note, "MIDI OFF");
+}
 static void midiAllOff() { allVoicesOff(); }
 
 // ---------------- MIDI byte parser ----------------
@@ -438,7 +706,7 @@ static void handleMidiMessage(uint8_t status, uint8_t d1, uint8_t d2) {
   xSemaphoreTake(stateLock, portMAX_DELAY);
   switch (type) {
     case 0x90:                                   // Note On
-      if (d2 > 0) midiNoteOn(d1);
+      if (d2 > 0) midiNoteOn(d1, d2);
       else        midiNoteOff(d1);               // velocity 0 = Note Off
       break;
     case 0x80:                                   // Note Off
@@ -540,7 +808,11 @@ static void printHelp() {
       "z/x: octave -/+   -/=: length -/+   space: stop   ?: help\r\n"
       "v: vibrato on/off   c: capture next MIDI burst on RX pin   m: send test note out of TX pin\r\n"
       "n: voice mode (poly -> mono -> unison)\r\n"
+      "1: record start/stop   2: play/pause (loops)   3: reset (stop + rewind)\r\n"
       "Knob: turn = choose setting, click = edit, turn = change value, click = done\r\n");
+  con_printf("Buttons: record=GPIO%d  play/pause=GPIO%d  reset=GPIO%d   take: %d events, %.2f s (%s)\r\n",
+             BTN_RECORD_PIN, BTN_PLAY_PIN, BTN_RESET_PIN, seqCount, seqLengthMs / 1000.0,
+             SEQ_STATE_NAMES[seqState]);
   con_printf("Vibrato: %s  rate %.1f Hz  depth +/-%.0f cents  delay %lu ms  fade %lu ms  %s\r\n",
              VIBRATO_ENABLED ? "ON" : "OFF", VIBRATO_RATE_HZ, VIBRATO_DEPTH_CENTS,
              (unsigned long)VIBRATO_DELAY_MS, (unsigned long)VIBRATO_FADE_MS,
@@ -559,11 +831,15 @@ static void handleKey(char c) {
   int semi = keyToSemitone(c);
   if (semi >= 0) {
     int midi = 12 * (octave + 1) + semi;   // C4 = MIDI 60
+    recKeyNote((uint8_t)midi, noteMs);
     voiceOn((uint8_t)midi, noteMs, "KEY     ");   // noteMs 0 = hold until space
     return;
   }
 
   switch (c) {
+    case '1': seqButton(SEQ_BTN_RECORD); break;   // same as the transport buttons
+    case '2': seqButton(SEQ_BTN_PLAY);   break;
+    case '3': seqButton(SEQ_BTN_RESET);  break;
     case 'z':
       if (octave > MIN_OCTAVE) octave--;
       con_printf("Octave %d\r\n", octave);
@@ -668,22 +944,50 @@ static int encReadDetents() {
   return ENC_REVERSE ? -steps : steps;
 }
 
-// Debounced button: returns true once per press (on the press, not release).
-static bool buttonPressed() {
-  static int  stableLevel = 1, lastLevel = 1;
-  static int  sameCount = 0;
-  int level = gpio_get_level((gpio_num_t)ENC_BTN_PIN);
-  if (level == lastLevel) {
-    if (sameCount < 3) sameCount++;
-  } else {
-    sameCount = 0;
-    lastLevel = level;
+// Debounced push button to GND: true once per press (on the press, not release).
+struct Debounced {
+  int      pin;
+  int      stable;      // accepted level (1 = released)
+  int      last;        // most recent raw level
+  uint32_t changedMs;   // when the raw level last changed
+};
+
+static bool debouncedPress(Debounced &b) {
+  int      level = gpio_get_level((gpio_num_t)b.pin);
+  uint32_t now   = millis();
+  if (level != b.last) {
+    b.last      = level;
+    b.changedMs = now;
+    return false;
   }
-  if (sameCount == 3 && level != stableLevel) {   // stable for ~30 ms
-    stableLevel = level;
+  if (level != b.stable && now - b.changedMs >= BTN_DEBOUNCE_MS) {
+    b.stable = level;
     return level == 0;                            // pressed = LOW
   }
   return false;
+}
+
+static Debounced encButton = {ENC_BTN_PIN, 1, 1, 0};
+static bool buttonPressed() { return debouncedPress(encButton); }
+
+// Transport buttons, in SeqButton order (record, play/pause, reset).
+static Debounced transportButtons[] = {
+  {BTN_RECORD_PIN, 1, 1, 0}, {BTN_PLAY_PIN, 1, 1, 0}, {BTN_RESET_PIN, 1, 1, 0}};
+
+static void transportInit() {
+  gpio_config_t io;
+  memset(&io, 0, sizeof(io));
+  io.pin_bit_mask = (1ULL << BTN_RECORD_PIN) | (1ULL << BTN_PLAY_PIN) | (1ULL << BTN_RESET_PIN);
+  io.mode         = GPIO_MODE_INPUT;
+  io.pull_up_en   = GPIO_PULLUP_ENABLE;           // button shorts the pin to GND
+  io.intr_type    = GPIO_INTR_DISABLE;            // polled + debounced in software
+  ESP_ERROR_CHECK(gpio_config(&io));
+}
+
+// Call regularly (every ~10 ms) with stateLock held.
+static void transportService() {
+  for (int i = 0; i < 3; i++)
+    if (debouncedPress(transportButtons[i])) seqButton(i);
 }
 
 // --- the settings list: add a row here to put a new setting on the knob ---
@@ -779,8 +1083,461 @@ static void knobService() {
   paramPrint(menuIndex);
 }
 
+// ---------------- desktop app link (JSON lines on the USB serial port) -------
+// A line starting with '{' is a request from desktop_app (see
+// desktop_app/FIRMWARE_INTERFACE.md); every other byte is a keyboard key.
+// Requests are flat JSON objects, so a tiny field finder is enough.
+// Everything here runs in consoleTask only.
+static constexpr int      REQ_LINE_MAX        = 1024;
+static constexpr int      XFER_CHUNK      = 384;          // max bytes per read_chunk
+static constexpr size_t   SEQ_MAX_FILE    = 64 * 1024;    // largest .mid the board accepts
+static constexpr uint32_t XFER_TIMEOUT_MS = 10000;        // drop half-finished transfers
+
+static uint8_t *readSnap  = nullptr;     // frozen .mid copy of the take being downloaded
+static size_t   readSize  = 0;
+static char     readTake[12] = "";
+static uint8_t *writeBuf  = nullptr;     // staged upload (old take plays until commit)
+static size_t   writeSize = 0, writeGot = 0;
+static char     writeTake[12] = "";
+static uint32_t xferTouchedMs = 0;
+static uint32_t takeCounter = 0;
+
+static void xferDropRead()  { free(readSnap); readSnap = nullptr; readTake[0] = 0; }
+static void xferDropWrite() { free(writeBuf); writeBuf = nullptr; writeTake[0] = 0; }
+
+// --- JSON fields ---
+static const char *jsonFind(const char *js, const char *key) {
+  char pat[24];
+  int  n = snprintf(pat, sizeof(pat), "\"%s\"", key);
+  for (const char *p = strstr(js, pat); p; p = strstr(p + n, pat)) {
+    const char *q = p + n;
+    while (*q == ' ') q++;
+    if (*q != ':') continue;                     // this was a value, not a key
+    q++;
+    while (*q == ' ') q++;
+    return q;
+  }
+  return nullptr;
+}
+
+// Plain string value (no escapes or control characters allowed).
+static bool jsonStrRef(const char *js, const char *key, const char **s, size_t *len) {
+  const char *v = jsonFind(js, key);
+  if (!v || *v != '"') return false;
+  const char *e = ++v;
+  for (; *e && *e != '"'; e++)
+    if (*e == '\\' || (unsigned char)*e < 0x20) return false;
+  if (*e != '"') return false;
+  *s   = v;
+  *len = (size_t)(e - v);
+  return true;
+}
+
+static bool jsonStr(const char *js, const char *key, char *out, size_t cap) {
+  const char *s;
+  size_t      len;
+  if (!jsonStrRef(js, key, &s, &len) || len >= cap) return false;
+  memcpy(out, s, len);
+  out[len] = 0;
+  return true;
+}
+
+static bool jsonInt(const char *js, const char *key, long *out) {
+  const char *v = jsonFind(js, key);
+  if (!v) return false;
+  char *end;
+  long  x = strtol(v, &end, 10);
+  if (end == v) return false;
+  *out = x;
+  return true;
+}
+
+// --- base64 ---
+static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static int b64Encode(const uint8_t *in, int n, char *out) {
+  int o = 0;
+  for (int i = 0; i < n; i += 3) {
+    uint32_t v = (uint32_t)in[i] << 16 | (i + 1 < n ? in[i + 1] << 8 : 0) | (i + 2 < n ? in[i + 2] : 0);
+    out[o++] = B64[(v >> 18) & 63];
+    out[o++] = B64[(v >> 12) & 63];
+    out[o++] = i + 1 < n ? B64[(v >> 6) & 63] : '=';
+    out[o++] = i + 2 < n ? B64[v & 63] : '=';
+  }
+  out[o] = 0;
+  return o;
+}
+
+static int b64Value(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+// Returns decoded byte count, or -1 if the text is invalid or won't fit.
+static int b64Decode(const char *in, size_t n, uint8_t *out, size_t cap) {
+  if (n == 0 || n % 4) return -1;
+  size_t o = 0;
+  for (size_t i = 0; i < n; i += 4) {
+    bool last = i + 4 == n;
+    int  a = b64Value(in[i]), b = b64Value(in[i + 1]);
+    int  c = (last && in[i + 2] == '=') ? -2 : b64Value(in[i + 2]);
+    int  d = (last && in[i + 3] == '=') ? -2 : b64Value(in[i + 3]);
+    if (a < 0 || b < 0 || c == -1 || d == -1 || (c == -2 && d != -2)) return -1;
+    uint32_t v = (uint32_t)a << 18 | (uint32_t)b << 12 | (uint32_t)(c < 0 ? 0 : c) << 6 | (d < 0 ? 0 : d);
+    int bytes = c == -2 ? 1 : d == -2 ? 2 : 3;
+    if (o + bytes > cap) return -1;
+    out[o++] = (uint8_t)(v >> 16);
+    if (bytes > 1) out[o++] = (uint8_t)(v >> 8);
+    if (bytes > 2) out[o++] = (uint8_t)v;
+  }
+  return (int)o;
+}
+
+// --- Standard MIDI File <-> take ---
+// Written files: format 0, one track, 480 ticks per beat at 480000 us per
+// beat, so 1 tick = 1 ms. End of Track sits at the loop length.
+static const uint8_t SMF_HEAD[]  = {'M', 'T', 'h', 'd', 0, 0, 0, 6, 0, 0, 0, 1, 0x01, 0xE0,
+                                    'M', 'T', 'r', 'k'};
+static const uint8_t SMF_TEMPO[] = {0x00, 0xFF, 0x51, 0x03, 0x07, 0x53, 0x00};
+static const uint8_t SMF_END[]   = {0xFF, 0x2F, 0x00};
+
+static int vlqLen(uint32_t x) {
+  int n = 1;
+  while (x >>= 7) n++;
+  return n;
+}
+
+static uint8_t *vlqPut(uint8_t *p, uint32_t x) {
+  uint8_t tmp[5];
+  int     n = 0;
+  tmp[n++] = x & 0x7F;
+  while (x >>= 7) tmp[n++] = 0x80 | (x & 0x7F);
+  while (n) *p++ = tmp[--n];
+  return p;
+}
+
+static bool vlqGet(const uint8_t *&p, const uint8_t *end, uint32_t *out) {
+  uint32_t x = 0;
+  for (int i = 0; i < 4 && p < end; i++) {
+    uint8_t b = *p++;
+    x = (x << 7) | (b & 0x7F);
+    if (!(b & 0x80)) { *out = x; return true; }
+  }
+  return false;
+}
+
+static uint32_t be32(const uint8_t *p) {
+  return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+static uint16_t be16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
+
+// call with stateLock held
+static size_t smfTrackLen() {
+  size_t   len  = sizeof(SMF_TEMPO) + sizeof(SMF_END);
+  uint32_t last = 0;
+  for (int i = 0; i < seqCount; i++) {
+    len += vlqLen(seqEvents[i].ms - last) + 3;
+    last = seqEvents[i].ms;
+  }
+  return len + vlqLen(seqLengthMs - last);
+}
+
+static size_t smfSize() { return sizeof(SMF_HEAD) + 4 + smfTrackLen(); }
+
+// call with stateLock held; p must have room for smfSize() bytes
+static void smfEncode(uint8_t *p) {
+  uint32_t trk = (uint32_t)smfTrackLen();
+  memcpy(p, SMF_HEAD, sizeof(SMF_HEAD));
+  p += sizeof(SMF_HEAD);
+  *p++ = trk >> 24; *p++ = trk >> 16; *p++ = trk >> 8; *p++ = trk;
+  memcpy(p, SMF_TEMPO, sizeof(SMF_TEMPO));
+  p += sizeof(SMF_TEMPO);
+  uint32_t last = 0;
+  for (int i = 0; i < seqCount; i++) {
+    const SeqEvent &e = seqEvents[i];
+    p    = vlqPut(p, e.ms - last);
+    *p++ = e.status;
+    *p++ = e.note;
+    *p++ = e.velocity;
+    last = e.ms;
+  }
+  p = vlqPut(p, seqLengthMs - last);
+  memcpy(p, SMF_END, sizeof(SMF_END));
+}
+
+// Reads a format-0 (or single-track format-1) MIDI file with any tick rate and
+// tempo changes. Keeps note on/off; skips everything else. Returns nullptr on
+// success or an error message. With out == nullptr it only validates + counts.
+static const char *smfDecode(const uint8_t *d, size_t n, SeqEvent *out, int *countOut,
+                             uint32_t *lengthOut) {
+  static char err[96];
+  const char *TRUNC = "Truncated MIDI file";
+  if (n < 14 || memcmp(d, "MThd", 4) != 0 || be32(d + 4) < 6 || be32(d + 4) > n - 8)
+    return "Not a MIDI file";
+  uint16_t format = be16(d + 8), tracks = be16(d + 10), division = be16(d + 12);
+  if (division & 0x8000) return "SMPTE-timed MIDI files are not supported";
+  if (division == 0) return "Bad MIDI header";
+  if (format == 2 || tracks != 1)
+    return "The synth stores single-track MIDI (the desktop app converts files automatically)";
+
+  const uint8_t *p   = d + 8 + be32(d + 4);
+  const uint8_t *end = d + n;
+  for (;;) {                                     // find the track (skip unknown chunks)
+    if (end - p < 8) return "MIDI file has no track";
+    uint32_t len = be32(p + 4);
+    if (len > (size_t)(end - p - 8)) return TRUNC;
+    if (memcmp(p, "MTrk", 4) == 0) { end = p + 8 + len; p += 8; break; }
+    p += 8 + len;
+  }
+
+  uint64_t tick = 0, tempoTick = 0, tempoUs = 0;
+  uint32_t tempo = 500000;                       // MIDI default: 120 bpm
+  uint8_t  running = 0;
+  int      count = 0;
+  uint32_t lastMs = 0, endMs = 0;
+  bool     ended = false;
+  while (p < end && !ended) {
+    uint32_t delta;
+    if (!vlqGet(p, end, &delta)) return TRUNC;
+    tick += delta;
+    uint64_t ms64 = (tempoUs + (tick - tempoTick) * tempo / division) / 1000;
+    if (ms64 > SEQ_MAX_LENGTH_MS) return "Recording is longer than 1 hour";
+    uint32_t ms = (uint32_t)ms64;
+    if (p >= end) return TRUNC;
+    uint8_t status = *p;
+    if (status & 0x80)  p++;
+    else if (!running)  return "Bad MIDI running status";
+    else                status = running;
+
+    if (status == 0xFF || status == 0xF0 || status == 0xF7) {   // meta / SysEx
+      uint8_t type = 0;
+      if (status == 0xFF) {
+        if (p >= end) return TRUNC;
+        type = *p++;
+      }
+      uint32_t len;
+      if (!vlqGet(p, end, &len) || len > (size_t)(end - p)) return TRUNC;
+      if (status == 0xFF && type == 0x51 && len == 3) {         // tempo change
+        uint32_t t = (uint32_t)p[0] << 16 | p[1] << 8 | p[2];
+        if (!t) return "Bad MIDI tempo";
+        tempoUs   = tempoUs + (tick - tempoTick) * tempo / division;
+        tempoTick = tick;
+        tempo     = t;
+      } else if (status == 0xFF && type == 0x2F) {              // end of track
+        ended = true;
+        endMs = ms;
+      }
+      p += len;
+      running = 0;
+      continue;
+    }
+    if (status >= 0xF0) return "Unsupported MIDI event";
+
+    running = status;
+    uint8_t type = status & 0xF0;
+    int     need = (type == 0xC0 || type == 0xD0) ? 1 : 2;
+    if (end - p < need) return TRUNC;
+    if ((p[0] & 0x80) || (need == 2 && (p[1] & 0x80))) return "Bad MIDI data byte";
+    if (type == 0x80 || type == 0x90) {
+      if (count == SEQ_MAX_EVENTS) {
+        snprintf(err, sizeof(err), "Too many notes for the synth (max %d note on/off events)",
+                 SEQ_MAX_EVENTS);
+        return err;
+      }
+      if (out) out[count] = {ms, (uint8_t)((type == 0x90 && p[1]) ? 0x90 : 0x80), p[0], p[1]};
+      count++;
+      lastMs = ms;
+    }
+    p += need;
+  }
+  if (!ended) return "MIDI track has no End of Track";
+  if (!count) return "No notes in this MIDI file";
+  *countOut  = count;
+  *lengthOut = endMs > lastMs ? endMs : lastMs + 1;
+  return nullptr;
+}
+
+// --- replies ---
+static char replyBuf[XFER_CHUNK * 4 / 3 + 160];
+
+static void replyOk(const char *id, const char *fields = "") {
+  int n = snprintf(replyBuf, sizeof(replyBuf), "{\"v\":1,\"id\":\"%s\",\"ok\":true%s}\n", id, fields);
+  if (n > 0 && n < (int)sizeof(replyBuf)) uart_write_bytes(CONSOLE_UART, replyBuf, n);
+}
+
+static void replyError(const char *id, const char *error) {
+  int n = snprintf(replyBuf, sizeof(replyBuf), "{\"v\":1,\"id\":\"%s\",\"ok\":false,\"error\":\"%s\"}\n",
+                   id, error);
+  if (n > 0 && n < (int)sizeof(replyBuf)) uart_write_bytes(CONSOLE_UART, replyBuf, n);
+}
+
+static bool takeMatches(const char *line, const char *expected) {
+  char take[12];
+  return expected[0] && jsonStr(line, "take", take, sizeof(take)) && strcmp(take, expected) == 0;
+}
+
+static void handleRequest(const char *line) {
+  char id[33], op[20];
+  long v = 0;
+  if (!jsonInt(line, "v", &v) || v != 1 || !jsonStr(line, "id", id, sizeof(id))) return;  // not ours
+  if (!jsonStr(line, "op", op, sizeof(op))) { replyError(id, "Missing op"); return; }
+  char fields[96];
+
+  if (strcmp(op, "hello") == 0) {
+    xferDropRead();
+    xferDropWrite();
+    snprintf(fields, sizeof(fields),
+             ",\"caps\":[\"midi_file\",\"transport\"],\"max_events\":%d,\"max_file\":%u",
+             SEQ_MAX_EVENTS, (unsigned)SEQ_MAX_FILE);
+    replyOk(id, fields);
+    xSemaphoreTake(stateLock, portMAX_DELAY);
+    seqPublish();
+    xSemaphoreGive(stateLock);
+    return;
+  }
+  if (strcmp(op, "ping") == 0) { replyOk(id); return; }
+
+  int button = strcmp(op, "record") == 0 ? SEQ_BTN_RECORD
+             : strcmp(op, "play") == 0   ? SEQ_BTN_PLAY
+             : strcmp(op, "reset") == 0  ? SEQ_BTN_RESET : -1;
+  if (button >= 0 || strcmp(op, "status") == 0) {
+    xSemaphoreTake(stateLock, portMAX_DELAY);
+    if (button >= 0) seqButton(button);          // publishes the new state
+    else             seqPublish();
+    xSemaphoreGive(stateLock);
+    replyOk(id);
+    return;
+  }
+
+  if (strcmp(op, "read_begin") == 0) {
+    xferDropRead();
+    const char *err = nullptr;
+    xSemaphoreTake(stateLock, portMAX_DELAY);
+    if (seqState == SEQ_RECORDING) err = "Stop recording first";
+    else if (!seqLengthMs)         err = "No recording on the synth yet";
+    else {
+      readSize = smfSize();
+      readSnap = (uint8_t *)malloc(readSize);
+      if (readSnap) smfEncode(readSnap);
+      else          err = "Not enough free SRAM to send the recording";
+    }
+    xSemaphoreGive(stateLock);
+    if (err) { replyError(id, err); return; }
+    snprintf(readTake, sizeof(readTake), "r%lu", (unsigned long)++takeCounter);
+    xferTouchedMs = millis();
+    snprintf(fields, sizeof(fields), ",\"take\":\"%s\",\"size\":%u", readTake, (unsigned)readSize);
+    replyOk(id, fields);
+    return;
+  }
+
+  if (strcmp(op, "read_chunk") == 0) {
+    long off, len;
+    if (!readSnap || !takeMatches(line, readTake)) { replyError(id, "Unknown take"); return; }
+    if (!jsonInt(line, "offset", &off) || !jsonInt(line, "length", &len) || off < 0 || len < 1 ||
+        len > XFER_CHUNK || (size_t)(off + len) > readSize) {
+      replyError(id, "Bad chunk range");
+      return;
+    }
+    xferTouchedMs = millis();
+    static char data[XFER_CHUNK * 4 / 3 + 24];
+    int n = snprintf(data, sizeof(data), ",\"data\":\"");
+    n += b64Encode(readSnap + off, (int)len, data + n);
+    snprintf(data + n, sizeof(data) - n, "\"");
+    replyOk(id, data);
+    return;
+  }
+
+  if (strcmp(op, "write_begin") == 0) {
+    long size;
+    xferDropWrite();
+    if (!jsonInt(line, "size", &size) || size < 14 || (size_t)size > SEQ_MAX_FILE) {
+      snprintf(fields, sizeof(fields), "MIDI file must be at most %u KB for the synth",
+               (unsigned)(SEQ_MAX_FILE / 1024));
+      replyError(id, fields);
+      return;
+    }
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < (size_t)size + 16384 ||
+        !(writeBuf = (uint8_t *)malloc(size))) {
+      replyError(id, "Not enough free SRAM for this file");
+      return;
+    }
+    writeSize = (size_t)size;
+    writeGot  = 0;
+    snprintf(writeTake, sizeof(writeTake), "w%lu", (unsigned long)++takeCounter);
+    xferTouchedMs = millis();
+    snprintf(fields, sizeof(fields), ",\"take\":\"%s\"", writeTake);
+    replyOk(id, fields);
+    return;
+  }
+
+  if (strcmp(op, "write_chunk") == 0) {
+    long        off;
+    const char *data;
+    size_t      dlen;
+    if (!writeBuf || !takeMatches(line, writeTake)) { replyError(id, "Unknown take"); return; }
+    if (!jsonInt(line, "offset", &off) || off != (long)writeGot) { replyError(id, "Chunk out of order"); return; }
+    int n = jsonStrRef(line, "data", &data, &dlen)
+                ? b64Decode(data, dlen, writeBuf + writeGot, writeSize - writeGot) : -1;
+    if (n <= 0) { replyError(id, "Bad chunk data"); return; }
+    writeGot += (size_t)n;
+    xferTouchedMs = millis();
+    replyOk(id);
+    return;
+  }
+
+  if (strcmp(op, "write_commit") == 0) {
+    if (!writeBuf || !takeMatches(line, writeTake)) { replyError(id, "Unknown take"); return; }
+    int         count  = 0;
+    uint32_t    length = 0;
+    const char *err    = writeGot != writeSize ? "Upload incomplete"
+                       : smfDecode(writeBuf, writeSize, nullptr, &count, &length);
+    if (!err) {
+      xSemaphoreTake(stateLock, portMAX_DELAY);
+      if (seqState == SEQ_RECORDING) {
+        err = "Stop recording first";
+      } else {                                   // swap the new take in
+        seqSilence();
+        smfDecode(writeBuf, writeSize, seqEvents, &seqCount, &seqLengthMs);
+        seqState = SEQ_STOPPED;
+        seqIndex = 0;
+        seqPosMs = 0;
+        con_printf("LOADED from desktop - %d events, %.2f s loop (press play)\r\n", seqCount,
+                   seqLengthMs / 1000.0);
+        seqPublish();
+      }
+      xSemaphoreGive(stateLock);
+    }
+    xferDropWrite();
+    if (err) { replyError(id, err); return; }
+    snprintf(fields, sizeof(fields), ",\"events\":%d,\"length_ms\":%lu", count, (unsigned long)length);
+    replyOk(id, fields);
+    return;
+  }
+
+  replyError(id, "Unsupported request");
+}
+
 // ---------------- tasks ----------------
 static QueueHandle_t midiUartQueue;
+static TaskHandle_t  seqTaskHandle;
+
+// 1 ms tick (FreeRTOS ticks are only 10 ms here) wakes the sequencer while playing.
+static void seqTickCb(void *) {
+  if (seqState == SEQ_PLAYING) xTaskNotifyGive(seqTaskHandle);
+}
+
+static void seqTask(void *) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    xSemaphoreTake(stateLock, portMAX_DELAY);
+    seqService();
+    xSemaphoreGive(stateLock);
+  }
+}
 
 // MIDI: wait for UART events (data or errors) from the driver.
 static void midiTask(void *) {
@@ -823,9 +1580,12 @@ static void midiTask(void *) {
   }
 }
 
-// Console: poll keys every 10 ms and handle keyboard note auto-release.
+// Console: keys + desktop-app requests, keyboard note auto-release, knob, buttons.
 static void consoleTask(void *) {
-  uint8_t buf[16];
+  static uint8_t buf[256];
+  static char    line[REQ_LINE_MAX];
+  int      lineLen = -1;            // -1 = not inside a desktop-app request line
+  bool     lineTooLong = false;
   uint32_t lastPinReport = 0;
   for (;;) {
     int n = uart_read_bytes(CONSOLE_UART, buf, sizeof(buf), pdMS_TO_TICKS(10));
@@ -853,10 +1613,39 @@ static void consoleTask(void *) {
       con_printf("TEST TX: 80 3C 00\r\n");
     }
 
+    for (int i = 0; i < n; i++) {
+      char c = (char)buf[i];
+      if (lineLen >= 0) {                        // inside a desktop-app request
+        if (c == '\n' || c == '\r') {
+          line[lineLen] = 0;
+          if (!lineTooLong) handleRequest(line);
+          lineLen = -1;
+        } else if (lineLen < REQ_LINE_MAX - 1) {
+          line[lineLen++] = c;
+        } else {
+          lineTooLong = true;
+        }
+      } else if (c == '{') {
+        line[0]     = c;
+        lineLen     = 1;
+        lineTooLong = false;
+      } else {
+        xSemaphoreTake(stateLock, portMAX_DELAY);
+        handleKey(c);
+        xSemaphoreGive(stateLock);
+      }
+    }
+
+    if ((readSnap || writeBuf) && millis() - xferTouchedMs > XFER_TIMEOUT_MS) {
+      xferDropRead();              // desktop went away mid-transfer
+      xferDropWrite();
+    }
+
     xSemaphoreTake(stateLock, portMAX_DELAY);
-    for (int i = 0; i < n; i++) handleKey((char)buf[i]);
     voiceServiceTimedReleases();   // ends keyboard notes after their length
+    recService();                  // records those note-offs too
     knobService();                 // rotary encoder settings menu
+    transportService();            // record / play / reset buttons
     xSemaphoreGive(stateLock);
   }
 }
@@ -890,11 +1679,21 @@ extern "C" void app_main(void) {
   gpio_isr_handler_add((gpio_num_t)MIDI_RX_PIN, rxEdgeIsr, nullptr);
 
   encoderInit();                  // rotary encoder A/B + button (pins set at top)
+  transportInit();                // record / play / reset buttons
 
   toneInit();
   pitchEngineStart();
   printHelp();
 
   xTaskCreate(midiTask,    "midi",    4096, nullptr, 10, nullptr);
-  xTaskCreate(consoleTask, "console", 4096, nullptr, 5,  nullptr);
+  xTaskCreate(seqTask,     "seq",     4096, nullptr, 8,  &seqTaskHandle);
+  xTaskCreate(consoleTask, "console", 6144, nullptr, 5,  nullptr);
+
+  esp_timer_create_args_t args;
+  memset(&args, 0, sizeof(args));
+  args.callback = seqTickCb;
+  args.name     = "seq";
+  esp_timer_handle_t seqTimer;
+  ESP_ERROR_CHECK(esp_timer_create(&args, &seqTimer));
+  ESP_ERROR_CHECK(esp_timer_start_periodic(seqTimer, 1000));
 }
