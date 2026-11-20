@@ -1,5 +1,5 @@
 /*
- * ESP32 MIDI + Serial Piano  ->  3 square-wave voices ("motors") on GPIO21/22/23
+ * ESP32 MIDI + Serial Piano  ->  3 square-wave voices ("motors") on GPIO22/21/19
  * Framework: ESP-IDF (6.x)
  *
  * Voice manager:
@@ -23,7 +23,7 @@
  *   space : stop everything       v : vibrato on/off      ? : help
  *   n     : voice mode: poly -> mono (motor 1 only) -> unison (all motors, same note)
  *
- * Rotary encoder (A=GPIO18, B=GPIO19, button=GPIO5) settings menu:
+ * Rotary encoder (A=GPIO12, B=GPIO14, button=GPIO13) settings menu:
  *   turn = choose a setting, click = edit it, turn = change value, click = done
  */
 
@@ -32,6 +32,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include "recording.h"
+#include "cJSON.h"
+#include "mbedtls/base64.h"
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -407,12 +411,23 @@ static void voiceServiceTimedReleases() {
   for (int v = 0; v < last; v++)
     if (voices[v].active && voices[v].releaseAtMs &&
         (int32_t)(ms - voices[v].releaseAtMs) >= 0)
-      voiceRelease(v, "KEY OFF ");
+      {
+        recording::capture(ms, voices[v].note, 0, false);
+        voiceRelease(v, "KEY OFF ");
+      }
 }
 
 // ---------------- MIDI note handling (call with stateLock held) ----------
-static void midiNoteOn(uint8_t note) { voiceOn(note, 0, "MIDI ON "); }
-static void midiNoteOff(uint8_t note) { voiceOff(note, "MIDI OFF"); }
+static void midiNoteOn(uint8_t note, uint8_t velocity) {
+  if (recording::mode() == recording::PLAYING) return;
+  recording::capture(millis(), note, velocity, true);
+  voiceOn(note, 0, "MIDI ON ");
+}
+static void midiNoteOff(uint8_t note) {
+  if (recording::mode() == recording::PLAYING) return;
+  recording::capture(millis(), note, 0, false);
+  voiceOff(note, "MIDI OFF");
+}
 static void midiAllOff() { allVoicesOff(); }
 
 // ---------------- MIDI byte parser ----------------
@@ -430,7 +445,7 @@ static void handleMidiMessage(uint8_t status, uint8_t d1, uint8_t d2) {
   xSemaphoreTake(stateLock, portMAX_DELAY);
   switch (type) {
     case 0x90:                                   // Note On
-      if (d2 > 0) midiNoteOn(d1);
+      if (d2 > 0) midiNoteOn(d1, d2);
       else        midiNoteOff(d1);               // velocity 0 = Note Off
       break;
     case 0x80:                                   // Note Off
@@ -528,6 +543,7 @@ static void printHelp() {
       "z/x: octave -/+   -/=: length -/+   space: stop   ?: help\r\n"
       "v: vibrato on/off   c: capture next MIDI burst on RX pin   m: send test note out of TX pin\r\n"
       "n: voice mode (poly -> mono -> unison)\r\n"
+      "1: record start/stop   2: playback start/stop (loop)   3: clear take\r\n"
       "Knob: turn = choose setting, click = edit, turn = change value, click = done\r\n");
   con_printf("Vibrato: %s  rate %.1f Hz  depth +/-%.0f cents  delay %lu ms  fade %lu ms  %s\r\n",
              VIBRATO_ENABLED ? "ON" : "OFF", VIBRATO_RATE_HZ, VIBRATO_DEPTH_CENTS,
@@ -546,12 +562,29 @@ static void handleKey(char c) {
   c = (char)tolower((unsigned char)c);
   int semi = keyToSemitone(c);
   if (semi >= 0) {
+    if (recording::mode()==recording::PLAYING) return;
     int midi = 12 * (octave + 1) + semi;   // C4 = MIDI 60
+    recording::capture(millis(), (uint8_t)midi, 100, true);
     voiceOn((uint8_t)midi, noteMs, "KEY     ");   // noteMs 0 = hold until space
     return;
   }
 
   switch (c) {
+    case '1':
+      if(recording::mode()!=recording::RECORDING) {
+        recording::stop(millis()); allVoicesOff(); recording::start(millis());
+        con_printf("RECORDING started (SRAM)\r\n");
+      } else { recording::stop(millis()); con_printf("RECORDING stopped: %u events\r\n", (unsigned)recording::count()); }
+      break;
+    case '2':
+      if(recording::mode()==recording::PLAYING) {
+        recording::stop(millis()); allVoicesOff(); con_printf("PLAYBACK stopped\r\n");
+      } else if(recording::mode()==recording::IDLE && recording::count()) {
+        allVoicesOff(); recording::play(millis()); con_printf("PLAYBACK looping\r\n");
+      } else con_printf("Stop recording / record notes before playback\r\n");
+      break;
+    case '3':
+      recording::reset(); allVoicesOff(); con_printf("Recording cleared\r\n"); break;
     case 'z':
       if (octave > MIN_OCTAVE) octave--;
       con_printf("Octave %d\r\n", octave);
@@ -571,6 +604,7 @@ static void handleKey(char c) {
       con_printf("Length %lu ms\r\n", (unsigned long)noteMs);
       break;
     case ' ':
+      for(int i=0;i<NUM_VOICES;i++) if(voices[i].active) recording::capture(millis(),voices[i].note,0,false);
       allVoicesOff();         // panic: stops keyboard and stuck MIDI notes
       break;
     case '?':
@@ -807,6 +841,105 @@ static void midiTask(void *) {
   }
 }
 
+
+// USB JSON-lines protocol for the desktop app. Called with stateLock held.
+// Do not use the serial monitor and desktop app at the same time (one USB port).
+static uint8_t upload[recording::MAX_FILE_BYTES];
+static size_t uploadSize=0, uploadAt=0;
+static bool uploading=false;
+static const uint8_t *download=nullptr;
+static size_t downloadSize=0;
+static bool downloading=false;
+static const char *TAKE_TOKEN="take1";
+static void protocolLine(const char *line) {
+  cJSON *req=cJSON_Parse(line);
+  if(!req)return;
+  cJSON *v=cJSON_GetObjectItemCaseSensitive(req,"v");
+  cJSON *id=cJSON_GetObjectItemCaseSensitive(req,"id");
+  cJSON *op=cJSON_GetObjectItemCaseSensitive(req,"op");
+  if(!cJSON_IsNumber(v) || v->valueint!=1 || !cJSON_IsString(id) || !cJSON_IsString(op)) {cJSON_Delete(req);return;}
+  cJSON *out=cJSON_CreateObject();
+  cJSON_AddNumberToObject(out,"v",1);
+  cJSON_AddStringToObject(out,"id",id->valuestring);
+  bool ok=true;
+  const char *err="Unsupported operation or invalid state";
+  const char *cmd=op->valuestring;
+  if(!strcmp(cmd,"hello")) {
+    cJSON *caps=cJSON_AddArrayToObject(out,"caps");
+    cJSON_AddItemToArray(caps,cJSON_CreateString("midi_file"));
+  } else if(!strcmp(cmd,"ping")) {
+  } else if(!strcmp(cmd,"record_start")) {
+    if(recording::mode()==recording::PLAYING) {recording::stop(millis()); allVoicesOff();}
+    allVoicesOff(); recording::start(millis());
+  } else if(!strcmp(cmd,"record_stop")) {
+    if(recording::mode()!=recording::RECORDING) ok=false;
+    else recording::stop(millis());
+  } else if(!strcmp(cmd,"play_start")) {
+    if(recording::mode()!=recording::IDLE || !recording::count()) ok=false;
+    else {allVoicesOff();recording::play(millis());}
+  } else if(!strcmp(cmd,"play_stop")) {
+    recording::stop(millis());allVoicesOff();
+  } else if(!strcmp(cmd,"record_clear")) {
+    recording::reset();allVoicesOff();
+  } else if(!strcmp(cmd,"record_status")) {
+    const char *m=recording::mode()==recording::RECORDING?"recording":recording::mode()==recording::PLAYING?"playing":"idle";
+    cJSON_AddStringToObject(out,"mode",m);
+    cJSON_AddNumberToObject(out,"events",recording::count());
+  } else if(!strcmp(cmd,"read_begin")) {
+    if(recording::mode()!=recording::IDLE || !recording::exportMidi(download,downloadSize)) ok=false;
+    else {downloading=true;cJSON_AddNumberToObject(out,"size",downloadSize);cJSON_AddStringToObject(out,"take",TAKE_TOKEN);}
+  } else if(!strcmp(cmd,"read_chunk")) {
+    cJSON *take=cJSON_GetObjectItem(req,"take"),*offset=cJSON_GetObjectItem(req,"offset"),*length=cJSON_GetObjectItem(req,"length");
+    if(!downloading || !cJSON_IsString(take) || strcmp(take->valuestring,TAKE_TOKEN) ||
+       !cJSON_IsNumber(offset)||!cJSON_IsNumber(length)||offset->valuedouble<0||length->valuedouble<1||length->valuedouble>384 ||
+       offset->valuedouble!=offset->valueint || length->valuedouble!=length->valueint ||
+       size_t(offset->valueint)>downloadSize || size_t(length->valueint)>downloadSize-size_t(offset->valueint))ok=false;
+    else {
+      unsigned char encoded[520];size_t bytes=0;
+      if(mbedtls_base64_encode(encoded,sizeof(encoded),&bytes,download+offset->valueint,length->valueint)!=0)ok=false;
+      else {encoded[bytes]=0;cJSON_AddStringToObject(out,"data",(const char *)encoded);}
+    }
+  } else if(!strcmp(cmd,"write_begin")) {
+    cJSON *size=cJSON_GetObjectItem(req,"size");
+    if(recording::mode()!=recording::IDLE || !cJSON_IsNumber(size) || size->valuedouble!=size->valueint ||
+       size->valueint<26 || size->valueint>int(recording::MAX_FILE_BYTES))ok=false;
+    else {uploadSize=size->valueint;uploadAt=0;uploading=true;downloading=false;cJSON_AddStringToObject(out,"take",TAKE_TOKEN);}
+  } else if(!strcmp(cmd,"write_chunk")) {
+    cJSON *take=cJSON_GetObjectItem(req,"take"),*offset=cJSON_GetObjectItem(req,"offset"),*data=cJSON_GetObjectItem(req,"data");
+    if(!uploading||!cJSON_IsString(take)||strcmp(take->valuestring,TAKE_TOKEN)||
+       !cJSON_IsNumber(offset)||offset->valuedouble!=offset->valueint||offset->valueint<0||
+       size_t(offset->valueint)!=uploadAt||!cJSON_IsString(data))ok=false;
+    else {size_t len=0;
+      if(mbedtls_base64_decode(upload+uploadAt,uploadSize-uploadAt,&len,(const unsigned char *)data->valuestring,strlen(data->valuestring))!=0)ok=false;
+      else uploadAt+=len;
+    }
+  } else if(!strcmp(cmd,"write_commit")) {
+    cJSON *take=cJSON_GetObjectItem(req,"take");
+    if(!uploading||!cJSON_IsString(take)||strcmp(take->valuestring,TAKE_TOKEN)||uploadAt!=uploadSize||
+       !recording::importMidi(upload,uploadSize))ok=false;
+    uploading=false;
+  } else ok=false;
+  cJSON_AddBoolToObject(out,"ok",ok);
+  if(!ok)cJSON_AddStringToObject(out,"error",err);
+  char *answer=cJSON_PrintUnformatted(out);
+  if(answer){con_printf("%s\r\n",answer);free(answer);}
+  cJSON_Delete(out);cJSON_Delete(req);
+}
+static char jsonLine[1024];
+static size_t jsonUsed=0;
+static bool inJson=false;
+static void consoleInput(uint8_t c) {
+  if(!inJson) {
+    if(c=='{') {inJson=true;jsonUsed=0;jsonLine[jsonUsed++]='{';}
+    else handleKey((char)c);
+    return;
+  }
+  if(c=='\n') {jsonLine[jsonUsed]=0;protocolLine(jsonLine);inJson=false;jsonUsed=0;return;}
+  if(c=='\r')return;
+  if(jsonUsed+1>=sizeof(jsonLine)) {inJson=false;jsonUsed=0;return;}
+  jsonLine[jsonUsed++]=char(c);
+}
+
 // Console: poll keys every 10 ms and handle keyboard note auto-release.
 static void consoleTask(void *) {
   uint8_t buf[16];
@@ -838,7 +971,12 @@ static void consoleTask(void *) {
     }
 
     xSemaphoreTake(stateLock, portMAX_DELAY);
-    for (int i = 0; i < n; i++) handleKey((char)buf[i]);
+    for (int i = 0; i < n; i++) consoleInput(buf[i]);
+    recording::Event ev;
+    for(int i=0;i<16 && recording::next(millis(),ev);i++) {
+      if(ev.on) voiceOn(ev.note,0,"PLAY ON ");
+      else voiceOff(ev.note,"PLAY OFF");
+    }
     voiceServiceTimedReleases();   // ends keyboard notes after their length
     knobService();                 // rotary encoder settings menu
     xSemaphoreGive(stateLock);
@@ -873,7 +1011,7 @@ extern "C" void app_main(void) {
   gpio_set_intr_type((gpio_num_t)MIDI_RX_PIN, GPIO_INTR_ANYEDGE);
   gpio_isr_handler_add((gpio_num_t)MIDI_RX_PIN, rxEdgeIsr, nullptr);
 
-  encoderInit();                  // rotary encoder on GPIO18/19, button on GPIO5
+  encoderInit();                  // rotary encoder on GPIO12/14, button on GPIO13
 
   toneInit();
   pitchEngineStart();

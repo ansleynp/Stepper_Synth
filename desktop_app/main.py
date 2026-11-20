@@ -51,6 +51,7 @@ class Studio:
         self.active = None
         self.pending = None
         self.board_mode = "ordinary"
+        self.record_mode = "idle"
         self.live = None
         self.selected = 60
         self.held = set()
@@ -175,6 +176,18 @@ class Studio:
         area.pack(side="bottom", fill="x", pady=10)
         self.count = label(area, "", 10, MUTED)
         self.count.pack(side="left")
+        commands = tk.Frame(self.records, bg=BG)
+        commands.pack(side="bottom", fill="x", pady=(0, 8))
+        self.rec_start = button(commands, "Start recording", lambda:self.job("record_start"), True)
+        self.rec_start.pack(side="left", padx=(0,5))
+        self.rec_stop = button(commands, "Stop recording", lambda:self.job("record_stop"))
+        self.rec_stop.pack(side="left", padx=5)
+        self.play_start = button(commands, "Play loop", lambda:self.job("play_start"))
+        self.play_start.pack(side="left", padx=5)
+        self.play_stop = button(commands, "Stop playback", lambda:self.job("play_stop"))
+        self.play_stop.pack(side="left", padx=5)
+        self.rec_clear = button(commands, "Clear take", self.clear_take)
+        self.rec_clear.pack(side="left", padx=5)
         self.loadbtn = button(area, "Load onto synth", self.load_file)
         self.loadbtn.pack(side="right")
         self.savebtn = button(area, "Save from synth", lambda:self.job("save"))
@@ -223,7 +236,7 @@ class Studio:
             data = p.read_bytes()
             mido.MidiFile(file=io.BytesIO(data))
             if messagebox.askyesno("Load recording", f"Replace the current synth take with {p.name}?"):
-                self.job("load", data)
+                self.job("load", files.normalize_for_synth(data))
         except Exception as exc:
             messagebox.showerror("Load recording", str(exc))
 
@@ -315,11 +328,19 @@ class Studio:
             return
         free = not self.busy
         available = free and self.board_mode=="ordinary" and "midi_file" in self.caps
+        idle = available and self.record_mode == "idle"
         for widget, enabled in [(self.apply_btn,free and "chords" in self.caps),
             (self.exit_btn,free and self.board_mode!="ordinary"),
-            (self.savebtn,available),(self.loadbtn,available and self.tree.selection()),
+            (self.savebtn,idle),(self.loadbtn,idle and self.tree.selection()),
+            (self.rec_start,idle),(self.rec_stop,available and self.record_mode=="recording"),
+            (self.play_start,idle),(self.play_stop,available and self.record_mode=="playing"),
+            (self.rec_clear,available),
             (self.connect_btn,bool(self.link) or bool(self.port.get()))]:
             widget.state(["!disabled" if enabled else "disabled"])
+
+    def clear_take(self):
+        if messagebox.askyesno("Clear recording", "Discard the recording currently in ESP32 RAM?"):
+            self.job("record_clear")
 
     def connect(self):
         if self.link:
@@ -340,6 +361,7 @@ class Studio:
         self.busy = False
         self.active = self.pending = self.live = None
         self.board_mode = "ordinary"
+        self.record_mode = "idle"
         self.indicator.configure(text="Offline")
         self.connect_btn.configure(text="Connect")
         self.render()
@@ -400,7 +422,18 @@ class Studio:
             elif op=="save":
                 self.local(lambda:self.save_take(result))
             elif op=="load":
+                self.record_mode = "idle"
                 self.status.configure(text="Recording loaded · acknowledged by ESP32")
+            elif op in ("record_start", "record_stop", "play_start", "play_stop", "record_clear"):
+                self.record_mode = {
+                    "record_start":"recording", "record_stop":"idle", "play_start":"playing",
+                    "play_stop":"idle", "record_clear":"idle"}[op]
+                self.status.configure(text={
+                    "record_start":"Recording MIDI events to ESP32 RAM",
+                    "record_stop":"Recording stopped · ready to save",
+                    "play_start":"Playback looping · MIDI input ignored until stopped",
+                    "play_stop":"Playback stopped",
+                    "record_clear":"ESP32 recording cleared"}[op])
             self.controls()
         self.root.after(80,self.poll)
 
