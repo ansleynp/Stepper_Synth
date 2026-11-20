@@ -8,6 +8,7 @@
         {
             "name": "PlatformIO",
             "includePath": [
+                "/Users/daniel.vu.05/gitspaces/senior_design_stepper_synth/src",
                 "/Users/daniel.vu.05/.platformio/packages/framework-espidf/components/xtensa/esp32/include",
                 "/Users/daniel.vu.05/.platformio/packages/framework-espidf/components/xtensa/include",
                 "/Users/daniel.vu.05/.platformio/packages/framework-espidf/components/xtensa/deprecated_include",
@@ -243,12 +244,12 @@
                 "/Users/daniel.vu.05/.platformio/packages/framework-espidf/components/perfmon/include",
                 "/Users/daniel.vu.05/.platformio/packages/framework-espidf/components/rt/include",
                 "/Users/daniel.vu.05/.platformio/packages/framework-espidf/components/spiffs/include",
-                "/Users/daniel.vu.05/gitspaces/senior_design_stepper_synth/src",
                 ""
             ],
             "browse": {
                 "limitSymbolsToIncludedHeaders": true,
                 "path": [
+                    "/Users/daniel.vu.05/gitspaces/senior_design_stepper_synth/src",
                     "/Users/daniel.vu.05/.platformio/packages/framework-espidf/components/xtensa/esp32/include",
                     "/Users/daniel.vu.05/.platformio/packages/framework-espidf/components/xtensa/include",
                     "/Users/daniel.vu.05/.platformio/packages/framework-espidf/components/xtensa/deprecated_include",
@@ -484,7 +485,6 @@
                     "/Users/daniel.vu.05/.platformio/packages/framework-espidf/components/perfmon/include",
                     "/Users/daniel.vu.05/.platformio/packages/framework-espidf/components/rt/include",
                     "/Users/daniel.vu.05/.platformio/packages/framework-espidf/components/spiffs/include",
-                    "/Users/daniel.vu.05/gitspaces/senior_design_stepper_synth/src",
                     ""
                 ]
             },

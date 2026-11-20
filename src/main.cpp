@@ -69,14 +69,14 @@ static const char *const VOICE_MODE_NAMES[] = {"poly", "mono", "unison"};
 
 // ---------------- configuration ----------------
 // One output per motor. Add/remove pins here (max 4: one LEDC timer each).
-static constexpr int        VOICE_PINS[]  = {21, 22, 23};
+static constexpr int        VOICE_PINS[]  = {22, 21, 19};
 static constexpr int        NUM_VOICES    = sizeof(VOICE_PINS) / sizeof(VOICE_PINS[0]);
 static_assert(NUM_VOICES >= 1 && NUM_VOICES <= 4, "LEDC low-speed mode has 4 timers");
 static constexpr int        MIDI_RX_PIN   = 16;          // MIDI data in
 static constexpr int        MIDI_TX_PIN   = 17;          // test output for 'm' loopback test
-static constexpr int        ENC_A_PIN     = 18;          // rotary encoder A (CLK)
-static constexpr int        ENC_B_PIN     = 19;          // rotary encoder B (DT)
-static constexpr int        ENC_BTN_PIN   = 5;           // encoder push button (SW), to GND when pressed
+static constexpr int        ENC_A_PIN     = 12;          // rotary encoder A (CLK)
+static constexpr int        ENC_B_PIN     = 14;          // rotary encoder B (DT)
+static constexpr int        ENC_BTN_PIN   = 13;           // encoder push button (SW), to GND when pressed
 static constexpr int        ENC_STEPS_PER_DETENT = 4;    // most encoders: 4 (try 2 if one click = 2 steps)
 static constexpr bool       ENC_REVERSE   = false;       // true if clockwise goes the wrong way
 static constexpr uart_port_t MIDI_UART    = UART_NUM_2;
@@ -318,7 +318,7 @@ static void startVoice(int v, uint8_t note, uint32_t holdMs, const char *tag, bo
   voices[v].releaseAtMs = holdMs ? millis() + holdMs : 0;
   engineSet(v, midiToFreq(note), now);
   if (print) {
-    char where[8];
+    char where[16];
     snprintf(where, sizeof(where), "M%d", v + 1);
     printStart(tag, note, where, replaced, oldNote);
   }
