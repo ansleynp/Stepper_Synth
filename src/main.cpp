@@ -45,6 +45,7 @@
 #include <cstring>
 
 #include "driver/gpio.h"
+#include "tft_ui.h"
 #include "esp_heap_caps.h"
 #include "driver/ledc.h"
 #include "hal/ledc_ll.h"   // direct access to the timer's fractional divider
@@ -1003,7 +1004,17 @@ struct Param {
 
 static const char *const SHAPE_NAMES[] = {"sine", "triangle"};
 
+// UI-only ADSR values until connected to the VREF / envelope engine.
+static uint32_t ADSR_ATTACK_MS  = 100;
+static uint32_t ADSR_DECAY_MS   = 200;
+static int      ADSR_SUSTAIN_PC = 70;
+static uint32_t ADSR_RELEASE_MS = 300;
+
 static const Param PARAMS[] = {
+  {"Attack",           P_U32,    &ADSR_ATTACK_MS,      0,    2000, 10,   "ms",    nullptr},
+  {"Decay",            P_U32,    &ADSR_DECAY_MS,       0,    2000, 10,   "ms",    nullptr},
+  {"Sustain",          P_INT,    &ADSR_SUSTAIN_PC,     0,    100,  5,    "%",     nullptr},
+  {"Release",          P_U32,    &ADSR_RELEASE_MS,     0,    2000, 10,   "ms",    nullptr},
   {"Voice mode",       P_CHOICE, &VOICE_MODE,          0,    2,    1,    "",      VOICE_MODE_NAMES},
   {"Unison detune",    P_FLOAT,  &UNISON_DETUNE_CENTS, 0,    50,   1,    "cents", nullptr},
   {"Vibrato",          P_BOOL,   &VIBRATO_ENABLED,     0,    1,    1,    "",      nullptr},
@@ -1081,6 +1092,46 @@ static void knobService() {
     menuIndex = ((menuIndex + steps) % NUM_PARAMS + NUM_PARAMS) % NUM_PARAMS;  // wrap around
   }
   paramPrint(menuIndex);
+}
+
+// Separate task: draw snapshots without holding the audio/sequencer mutex
+// during SPI transfers. Encoder remains handled by the existing knobService().
+static void lcdTask(void *) {
+  TftUiState ui = {};
+  for (;;) {
+    xSemaphoreTake(stateLock, portMAX_DELAY);
+    ui.selected = menuIndex;
+    ui.editing = menuEditing;
+    ui.activeVoices = 0;
+    for (int i=0;i<NUM_VOICES;i++) if (voices[i].active) ui.activeVoices++;
+    ui.recordingState = (int)seqState;
+    ui.hasRecording = seqLengthMs > 0;
+    ui.attackMs = (int)ADSR_ATTACK_MS;
+    ui.decayMs = (int)ADSR_DECAY_MS;
+    ui.sustainPct = ADSR_SUSTAIN_PC;
+    ui.releaseMs = (int)ADSR_RELEASE_MS;
+    ui.otherCount = NUM_PARAMS - 4;
+    if (ui.otherCount > 16) ui.otherCount = 16;
+    for (int i=0;i<ui.otherCount;i++) {
+      const Param &p = PARAMS[i+4];
+      ui.otherNames[i] = p.name;
+      switch (p.type) {
+        case P_BOOL:
+          snprintf(ui.otherValues[i],sizeof(ui.otherValues[i]),"%s",*(bool*)p.ptr?"ON":"OFF"); break;
+        case P_INT:
+          snprintf(ui.otherValues[i],sizeof(ui.otherValues[i]),"%d",*(int*)p.ptr); break;
+        case P_U32:
+          snprintf(ui.otherValues[i],sizeof(ui.otherValues[i]),"%lu",(unsigned long)*(uint32_t*)p.ptr); break;
+        case P_FLOAT:
+          snprintf(ui.otherValues[i],sizeof(ui.otherValues[i]),"%.1f",*(float*)p.ptr); break;
+        case P_CHOICE:
+          snprintf(ui.otherValues[i],sizeof(ui.otherValues[i]),"%s",p.choices[*(int*)p.ptr]); break;
+      }
+    }
+    xSemaphoreGive(stateLock);
+    tftUiDraw(ui);
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
 }
 
 // ---------------- desktop app link (JSON lines on the USB serial port) -------
@@ -1680,6 +1731,7 @@ extern "C" void app_main(void) {
 
   encoderInit();                  // rotary encoder A/B + button (pins set at top)
   transportInit();                // record / play / reset buttons
+  tftUiInit();                    // 320x240 SPI TFT LCD
 
   toneInit();
   pitchEngineStart();
@@ -1688,6 +1740,7 @@ extern "C" void app_main(void) {
   xTaskCreate(midiTask,    "midi",    4096, nullptr, 10, nullptr);
   xTaskCreate(seqTask,     "seq",     4096, nullptr, 8,  &seqTaskHandle);
   xTaskCreate(consoleTask, "console", 6144, nullptr, 5,  nullptr);
+  xTaskCreate(lcdTask,     "lcd",     4096, nullptr, 3,  nullptr);
 
   esp_timer_create_args_t args;
   memset(&args, 0, sizeof(args));
